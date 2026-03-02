@@ -1,0 +1,17 @@
+[project]
+name = "pipeline-test"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28.1",
+    "openmeteo-requests>=1.7.5",
+    "pandas>=3.0.1",
+    "pyarrow>=23.0.1",
+    "pyspark>=4.1.1",
+    "requests>=2.32.5",
+    "requests-cache>=1.3.0",
+    "retry-requests>=2.0.0",
+    "tenacity>=9.1.4",
+]
