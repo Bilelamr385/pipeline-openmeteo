@@ -100,7 +100,6 @@ class OpenMeteoExtractor(BaseExtractor):
         self.request_timeout_s = request_timeout_s
         self.api_url = api_url
         self.circuit_breaker = CircuitBreaker(CircuitBreakerConfig())
-        self._write_lock = asyncio.Lock()
 
     def _load_cities(self) -> list[City]:
         cities: list[City] = []
@@ -160,44 +159,54 @@ class OpenMeteoExtractor(BaseExtractor):
     async def _extract_one(
         self,
         city: City,
-        output_file: Path,
         semaphore: asyncio.Semaphore,
-    ) -> bool:
+    ) -> tuple[bool, list[dict[str, Any]]]:
         async with semaphore:
             try:
                 payload = await call_with_circuit_breaker(self.circuit_breaker, self._fetch_city, city)
-                records = self._to_records(city, payload)
-                async with self._write_lock:
-                    with output_file.open("a", encoding="utf-8") as out:
-                        for row in records:
-                            out.write(json.dumps(row, ensure_ascii=False) + "\n")
+                return True, self._to_records(city, payload)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("City extraction failed city=%s error=%s", city.city, exc)
-                return False
-            return True
+                return False, []
+
+    @staticmethod
+    def _write_parquet(output_file: Path, records: list[dict[str, Any]]) -> None:
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError as exc:
+            raise RuntimeError(
+                "pyarrow is required to write Parquet output. Install project dependencies first."
+            ) from exc
+
+        table = pa.Table.from_pylist(records)
+        pq.write_table(table, output_file)
 
     async def extract_full(self) -> Path:
         cities = self._load_cities()
         logger.info("Starting extraction for %s cities", len(cities))
 
-        output_file = self.output_dir / f"openmeteo_hourly_{self.start_date}_{self.end_date}.ndjson"
-        output_file.write_text("", encoding="utf-8")
+        output_file = self.output_dir / f"openmeteo_hourly_{self.start_date}_{self.end_date}.parquet"
 
         semaphore = asyncio.Semaphore(self.concurrency)
-        tasks = [self._extract_one(city, output_file, semaphore) for city in cities]
+        tasks = [self._extract_one(city, semaphore) for city in cities]
         results = await asyncio.gather(*tasks)
-        success_count = sum(1 for ok in results if ok)
+
+        success_count = sum(1 for ok, _ in results if ok)
         failure_count = len(results) - success_count
+        records: list[dict[str, Any]] = [row for _, city_rows in results for row in city_rows]
+
+        self._write_parquet(output_file, records)
 
         logger.info("Extraction done. Output file: %s", output_file)
-        logger.info("Summary: success=%s failure=%s", success_count, failure_count)
+        logger.info("Summary: success=%s failure=%s rows=%s", success_count, failure_count, len(records))
         return output_file
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Extract Open-Meteo hourly weather for cities CSV")
     parser.add_argument("--cities-csv", type=Path, default=Path("data/cities_10000.csv"))
-    parser.add_argument("--output-dir", type=Path, default=Path("data/output"))
+    parser.add_argument("--output-dir", type=Path, default=Path("data/bronze"))
     parser.add_argument("--start-date", type=date.fromisoformat, default=date.today())
     parser.add_argument("--end-date", type=date.fromisoformat, default=date.today())
     parser.add_argument("--concurrency", type=int, default=100)

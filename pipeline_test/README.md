@@ -10,7 +10,7 @@ Ce projet contient un extracteur asynchrone Open-Meteo pour récupérer, pour ju
 - `src/ingestion/common/retry.py` :
   - décorateur `with_retry` (backoff exponentiel + jitter),
   - circuit breaker (`CircuitBreaker`) pour éviter d'insister sur un service en erreur.
-- `src/ingestion/open_meteo/extractor.py` : extracteur Open-Meteo asynchrone (`httpx.AsyncClient`) avec concurrence configurable.
+- `src/ingestion/open_meteo/extractor.py` : extracteur Open-Meteo asynchrone (requêtes HTTP via `urllib` + orchestration `asyncio`) avec concurrence configurable.
 
 ## Variables extraites
 
@@ -25,7 +25,7 @@ Depuis `pipeline_test/`:
 ```bash
 PYTHONPATH=. python src/ingestion/open_meteo/extractor.py \
   --cities-csv data/cities_10000.csv \
-  --output-dir data/output \
+  --output-dir data/bronze \
   --start-date 2025-01-01 \
   --end-date 2025-01-01 \
   --concurrency 100 \
@@ -34,8 +34,8 @@ PYTHONPATH=. python src/ingestion/open_meteo/extractor.py \
 
 ## Sortie
 
-- Fichier NDJSON: `data/output/openmeteo_hourly_<start>_<end>.ndjson`
-- 1 ligne JSON par observation horaire (ville + timestamp + toutes les variables).
+- Fichier Parquet: `data/bronze/openmeteo_hourly_<start>_<end>.parquet`
+- Format colonne (1 table Parquet) avec une ligne par observation horaire (ville + timestamp + variables).
 
 ## Notes perf
 
