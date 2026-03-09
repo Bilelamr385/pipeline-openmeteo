@@ -5,7 +5,7 @@ OpenMEteo extractor
 from logging import Logger
 import logging
 from pathlib import Path
-from datetimeimport datetime,date
+from datetime import datetime,date
 from uuid import uuid4
 from src.ingestion.comon.base_extractor import Base_extractor
 
