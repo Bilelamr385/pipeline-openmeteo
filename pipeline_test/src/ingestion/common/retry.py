@@ -82,7 +82,7 @@ class _CallRecord :
 
 @property
 def state(self) -> CircuitState:
-    return self.state
+    return self.state 
 def allow_request(self) -> bool:
     """
     check wether a request is allowed
