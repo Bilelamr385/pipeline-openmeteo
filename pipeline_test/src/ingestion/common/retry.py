@@ -1,4 +1,4 @@
-"""Retry and circuit-breaker utilities for HTTP based extractors."""
+"""Retry and circuit-breaker utilities for extractors."""
 
 from __future__ import annotations
 
@@ -10,8 +10,6 @@ from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable, Deque, Optional, TypeVar
-
-import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +25,7 @@ class RetryConfig:
     max_delay: float = 30.0
     multiplier: float = 2.0
     jitter: float = 0.2
-    retryable_exceptions: tuple[type[Exception], ...] = (
-        httpx.TimeoutException,
-        httpx.ConnectError,
-        httpx.ReadError,
-        httpx.RemoteProtocolError,
-    )
+    retryable_exceptions: tuple[type[Exception], ...] = (TimeoutError, OSError)
     retryable_status_codes: frozenset[int] = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 
@@ -54,23 +47,20 @@ def with_retry(config: RetryConfig) -> Callable[[F], F]:
                 last_exc: Optional[Exception] = None
                 for attempt in range(1, config.max_attempts + 1):
                     try:
-                        result = await func(*args, **kwargs)
-                        if isinstance(result, httpx.Response) and result.status_code in config.retryable_status_codes:
-                            result.raise_for_status()
-                        return result
+                        return await func(*args, **kwargs)
                     except config.retryable_exceptions as exc:
                         last_exc = exc
-                    except httpx.HTTPStatusError as exc:
-                        if exc.response.status_code not in config.retryable_status_codes:
-                            raise
-                        last_exc = exc
-
-                    if attempt == config.max_attempts:
-                        break
-                    delay = _compute_delay(config, attempt)
-                    logger.warning("Retrying %s attempt=%s/%s in %.2fs", func.__name__, attempt, config.max_attempts, delay)
-                    await asyncio.sleep(delay)
-
+                        if attempt == config.max_attempts:
+                            break
+                        delay = _compute_delay(config, attempt)
+                        logger.warning(
+                            "Retrying %s attempt=%s/%s in %.2fs",
+                            func.__name__,
+                            attempt,
+                            config.max_attempts,
+                            delay,
+                        )
+                        await asyncio.sleep(delay)
                 assert last_exc is not None
                 raise last_exc
 
@@ -80,22 +70,20 @@ def with_retry(config: RetryConfig) -> Callable[[F], F]:
             last_exc: Optional[Exception] = None
             for attempt in range(1, config.max_attempts + 1):
                 try:
-                    result = func(*args, **kwargs)
-                    if isinstance(result, httpx.Response) and result.status_code in config.retryable_status_codes:
-                        result.raise_for_status()
-                    return result
+                    return func(*args, **kwargs)
                 except config.retryable_exceptions as exc:
                     last_exc = exc
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code not in config.retryable_status_codes:
-                        raise
-                    last_exc = exc
-
-                if attempt == config.max_attempts:
-                    break
-                delay = _compute_delay(config, attempt)
-                logger.warning("Retrying %s attempt=%s/%s in %.2fs", func.__name__, attempt, config.max_attempts, delay)
-                time.sleep(delay)
+                    if attempt == config.max_attempts:
+                        break
+                    delay = _compute_delay(config, attempt)
+                    logger.warning(
+                        "Retrying %s attempt=%s/%s in %.2fs",
+                        func.__name__,
+                        attempt,
+                        config.max_attempts,
+                        delay,
+                    )
+                    time.sleep(delay)
 
             assert last_exc is not None
             raise last_exc

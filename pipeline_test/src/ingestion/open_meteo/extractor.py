@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any
-
-import httpx
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 from src.ingestion.common.base_extractor import BaseExtractor
 from src.ingestion.common.retry import (
@@ -90,6 +90,7 @@ class OpenMeteoExtractor(BaseExtractor):
         end_date: date,
         concurrency: int = 100,
         request_timeout_s: float = 30.0,
+        api_url: str = "https://api.open-meteo.com/v1/forecast",
     ) -> None:
         super().__init__(output_dir=output_dir)
         self.cities_csv = cities_csv
@@ -97,8 +98,7 @@ class OpenMeteoExtractor(BaseExtractor):
         self.end_date = end_date
         self.concurrency = concurrency
         self.request_timeout_s = request_timeout_s
-        self.api_url = "https://api.open-meteo.com/v1/forecast"
-        self.retry_config = RetryConfig(max_attempts=5)
+        self.api_url = api_url
         self.circuit_breaker = CircuitBreaker(CircuitBreakerConfig())
         self._write_lock = asyncio.Lock()
 
@@ -117,21 +117,25 @@ class OpenMeteoExtractor(BaseExtractor):
                 )
         return cities
 
-    @with_retry(RetryConfig(max_attempts=5))
-    async def _fetch_city(self, client: httpx.AsyncClient, city: City) -> dict[str, Any]:
-        response = await client.get(
-            self.api_url,
-            params={
+    def _fetch_city_sync(self, city: City) -> dict[str, Any]:
+        query = urlencode(
+            {
                 "latitude": city.latitude,
                 "longitude": city.longitude,
                 "hourly": ",".join(OPEN_METEO_HOURLY_PARAMS),
                 "timezone": "UTC",
                 "start_date": self.start_date.isoformat(),
                 "end_date": self.end_date.isoformat(),
-            },
+            }
         )
-        response.raise_for_status()
-        return response.json()
+        url = f"{self.api_url}?{query}"
+        with urlopen(url, timeout=self.request_timeout_s) as response:  # noqa: S310
+            payload = response.read().decode("utf-8")
+            return json.loads(payload)
+
+    @with_retry(RetryConfig(max_attempts=5))
+    async def _fetch_city(self, city: City) -> dict[str, Any]:
+        return await asyncio.to_thread(self._fetch_city_sync, city)
 
     @staticmethod
     def _to_records(city: City, payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -155,14 +159,13 @@ class OpenMeteoExtractor(BaseExtractor):
 
     async def _extract_one(
         self,
-        client: httpx.AsyncClient,
         city: City,
         output_file: Path,
         semaphore: asyncio.Semaphore,
-    ) -> None:
+    ) -> bool:
         async with semaphore:
             try:
-                payload = await call_with_circuit_breaker(self.circuit_breaker, self._fetch_city, client, city)
+                payload = await call_with_circuit_breaker(self.circuit_breaker, self._fetch_city, city)
                 records = self._to_records(city, payload)
                 async with self._write_lock:
                     with output_file.open("a", encoding="utf-8") as out:
@@ -170,6 +173,8 @@ class OpenMeteoExtractor(BaseExtractor):
                             out.write(json.dumps(row, ensure_ascii=False) + "\n")
             except Exception as exc:  # noqa: BLE001
                 logger.exception("City extraction failed city=%s error=%s", city.city, exc)
+                return False
+            return True
 
     async def extract_full(self) -> Path:
         cities = self._load_cities()
@@ -178,15 +183,14 @@ class OpenMeteoExtractor(BaseExtractor):
         output_file = self.output_dir / f"openmeteo_hourly_{self.start_date}_{self.end_date}.ndjson"
         output_file.write_text("", encoding="utf-8")
 
-        timeout = httpx.Timeout(timeout=self.request_timeout_s)
-        limits = httpx.Limits(max_connections=self.concurrency, max_keepalive_connections=self.concurrency)
-
-        async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
-            semaphore = asyncio.Semaphore(self.concurrency)
-            tasks = [self._extract_one(client, city, output_file, semaphore) for city in cities]
-            await asyncio.gather(*tasks)
+        semaphore = asyncio.Semaphore(self.concurrency)
+        tasks = [self._extract_one(city, output_file, semaphore) for city in cities]
+        results = await asyncio.gather(*tasks)
+        success_count = sum(1 for ok in results if ok)
+        failure_count = len(results) - success_count
 
         logger.info("Extraction done. Output file: %s", output_file)
+        logger.info("Summary: success=%s failure=%s", success_count, failure_count)
         return output_file
 
 
@@ -198,6 +202,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end-date", type=date.fromisoformat, default=date.today())
     parser.add_argument("--concurrency", type=int, default=100)
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--api-url", default="https://api.open-meteo.com/v1/forecast")
     return parser
 
 
@@ -211,6 +216,7 @@ async def _run_from_cli() -> None:
         start_date=args.start_date,
         end_date=args.end_date,
         concurrency=args.concurrency,
+        api_url=args.api_url,
     )
     await extractor.extract_full()
 
