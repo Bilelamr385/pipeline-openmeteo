@@ -29,6 +29,7 @@ PYTHONPATH=. python src/ingestion/open_meteo/extractor.py \
   --start-date 2025-01-01 \
   --end-date 2025-01-01 \
   --concurrency 10 \
+  --max-rounds 0 \
   --api-url https://api.open-meteo.com/v1/forecast
 ```
 
@@ -53,3 +54,4 @@ L'extracteur supporte `--api-url` pour ça.
 
 Si tu vois des `HTTP Error 429`, baisse `--concurrency` (ex: 5 ou 10).
 Le retry applique un backoff exponentiel et respecte `Retry-After` quand l'API le renvoie.
+Les villes en 429 sont replanifiées par vagues avec une phase de cooldown globale pour éviter de bloquer définitivement le run.

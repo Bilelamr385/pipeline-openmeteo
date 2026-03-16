@@ -7,10 +7,12 @@ import asyncio
 import csv
 import json
 import logging
+import tempfile
+import time
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -80,6 +82,13 @@ class City:
     country: str
 
 
+@dataclass(frozen=True)
+class ExtractionResult:
+    status: Literal["ok", "retry", "failed"]
+    city: City
+    records: list[dict[str, Any]]
+
+
 class OpenMeteoExtractor(BaseExtractor):
     """Extract hourly weather data from Open-Meteo for a city list."""
 
@@ -92,6 +101,7 @@ class OpenMeteoExtractor(BaseExtractor):
         concurrency: int = 10,
         request_timeout_s: float = 30.0,
         api_url: str = "https://api.open-meteo.com/v1/forecast",
+        max_rounds: int = 0,
     ) -> None:
         super().__init__(output_dir=output_dir)
         self.cities_csv = cities_csv
@@ -100,6 +110,7 @@ class OpenMeteoExtractor(BaseExtractor):
         self.concurrency = concurrency
         self.request_timeout_s = request_timeout_s
         self.api_url = api_url
+        self.max_rounds = max_rounds
         self.circuit_breaker = CircuitBreaker(CircuitBreakerConfig())
 
     def _load_cities(self) -> list[City]:
@@ -157,53 +168,119 @@ class OpenMeteoExtractor(BaseExtractor):
             records.append(item)
         return records
 
-    async def _extract_one(
-        self,
-        city: City,
-        semaphore: asyncio.Semaphore,
-    ) -> tuple[bool, list[dict[str, Any]]]:
+    async def _extract_one(self, city: City, semaphore: asyncio.Semaphore) -> ExtractionResult:
         async with semaphore:
             try:
                 payload = await call_with_circuit_breaker(self.circuit_breaker, self._fetch_city, city)
-                return True, self._to_records(city, payload)
+                return ExtractionResult(status="ok", city=city, records=self._to_records(city, payload))
             except HTTPError as exc:
+                if exc.code == 429:
+                    return ExtractionResult(status="retry", city=city, records=[])
                 logger.warning("City extraction failed city=%s http_status=%s", city.city, exc.code)
-                return False, []
+                return ExtractionResult(status="failed", city=city, records=[])
             except Exception as exc:  # noqa: BLE001
                 logger.exception("City extraction failed city=%s error=%s", city.city, exc)
-                return False, []
+                return ExtractionResult(status="failed", city=city, records=[])
 
     @staticmethod
-    def _write_parquet(output_file: Path, records: list[dict[str, Any]]) -> None:
+    def _append_ndjson(path: Path, records: list[dict[str, Any]]) -> None:
+        if not records:
+            return
+        with path.open("a", encoding="utf-8") as handle:
+            for row in records:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _ndjson_to_parquet(ndjson_path: Path, parquet_path: Path, chunk_size: int = 5000) -> None:
         try:
             import pyarrow as pa
             import pyarrow.parquet as pq
         except ImportError as exc:
-            raise RuntimeError(
-                "pyarrow is required to write Parquet output. Install project dependencies first."
-            ) from exc
+            raise RuntimeError("pyarrow is required to write Parquet output. Install project dependencies first.") from exc
 
-        table = pa.Table.from_pylist(records)
-        pq.write_table(table, output_file)
+        writer: pq.ParquetWriter | None = None
+        chunk: list[dict[str, Any]] = []
+        with ndjson_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                chunk.append(json.loads(line))
+                if len(chunk) >= chunk_size:
+                    table = pa.Table.from_pylist(chunk)
+                    if writer is None:
+                        writer = pq.ParquetWriter(parquet_path, table.schema)
+                    writer.write_table(table)
+                    chunk = []
+
+        if chunk:
+            table = pa.Table.from_pylist(chunk)
+            if writer is None:
+                writer = pq.ParquetWriter(parquet_path, table.schema)
+            writer.write_table(table)
+
+        if writer is not None:
+            writer.close()
 
     async def extract_full(self) -> Path:
         cities = self._load_cities()
         logger.info("Starting extraction for %s cities", len(cities))
 
         output_file = self.output_dir / f"openmeteo_hourly_{self.start_date}_{self.end_date}.parquet"
+        temp_ndjson = Path(tempfile.gettempdir()) / (
+            f"openmeteo_{int(time.time())}_{self.start_date}_{self.end_date}.ndjson"
+        )
+        if temp_ndjson.exists():
+            temp_ndjson.unlink()
 
+        pending = cities
+        success_count = 0
+        failed_count = 0
+        round_no = 0
         semaphore = asyncio.Semaphore(self.concurrency)
-        tasks = [self._extract_one(city, semaphore) for city in cities]
-        results = await asyncio.gather(*tasks)
 
-        success_count = sum(1 for ok, _ in results if ok)
-        failure_count = len(results) - success_count
-        records: list[dict[str, Any]] = [row for _, city_rows in results for row in city_rows]
+        while pending:
+            round_no += 1
+            if self.max_rounds > 0 and round_no > self.max_rounds:
+                logger.warning("Reached max_rounds=%s, stopping with %s pending cities", self.max_rounds, len(pending))
+                failed_count += len(pending)
+                break
 
-        self._write_parquet(output_file, records)
+            logger.info("Round %s: processing %s cities", round_no, len(pending))
+            tasks = [self._extract_one(city, semaphore) for city in pending]
+            results = await asyncio.gather(*tasks)
 
-        logger.info("Extraction done. Output file: %s", output_file)
-        logger.info("Summary: success=%s failure=%s rows=%s", success_count, failure_count, len(records))
+            next_pending: list[City] = []
+            for result in results:
+                if result.status == "ok":
+                    success_count += 1
+                    self._append_ndjson(temp_ndjson, result.records)
+                elif result.status == "retry":
+                    next_pending.append(result.city)
+                else:
+                    failed_count += 1
+
+            pending = next_pending
+            if pending:
+                cooldown = min(300, 5 * (2 ** min(round_no - 1, 5)))
+                logger.warning(
+                    "Rate limited on %s cities. Cooling down %ss before retry round %s",
+                    len(pending),
+                    cooldown,
+                    round_no + 1,
+                )
+                await asyncio.sleep(cooldown)
+
+        if temp_ndjson.exists() and temp_ndjson.stat().st_size > 0:
+            self._ndjson_to_parquet(temp_ndjson, output_file)
+            temp_ndjson.unlink(missing_ok=True)
+        else:
+            logger.warning("No successful records extracted; no parquet file generated")
+
+        logger.info(
+            "Extraction done. Output file: %s | success=%s failed=%s pending=%s",
+            output_file,
+            success_count,
+            failed_count,
+            len(pending),
+        )
         return output_file
 
 
@@ -214,6 +291,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-date", type=date.fromisoformat, default=date.today())
     parser.add_argument("--end-date", type=date.fromisoformat, default=date.today())
     parser.add_argument("--concurrency", type=int, default=10)
+    parser.add_argument("--max-rounds", type=int, default=0, help="0 = retry until all 429 cities succeed")
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--api-url", default="https://api.open-meteo.com/v1/forecast")
     return parser
@@ -230,6 +308,7 @@ async def _run_from_cli() -> None:
         end_date=args.end_date,
         concurrency=args.concurrency,
         api_url=args.api_url,
+        max_rounds=args.max_rounds,
     )
     await extractor.extract_full()
 
