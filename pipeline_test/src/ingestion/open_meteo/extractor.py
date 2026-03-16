@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -88,7 +89,7 @@ class OpenMeteoExtractor(BaseExtractor):
         output_dir: Path,
         start_date: date,
         end_date: date,
-        concurrency: int = 100,
+        concurrency: int = 10,
         request_timeout_s: float = 30.0,
         api_url: str = "https://api.open-meteo.com/v1/forecast",
     ) -> None:
@@ -132,7 +133,7 @@ class OpenMeteoExtractor(BaseExtractor):
             payload = response.read().decode("utf-8")
             return json.loads(payload)
 
-    @with_retry(RetryConfig(max_attempts=5))
+    @with_retry(RetryConfig(max_attempts=6, base_delay=1.0, max_delay=90.0))
     async def _fetch_city(self, city: City) -> dict[str, Any]:
         return await asyncio.to_thread(self._fetch_city_sync, city)
 
@@ -165,6 +166,9 @@ class OpenMeteoExtractor(BaseExtractor):
             try:
                 payload = await call_with_circuit_breaker(self.circuit_breaker, self._fetch_city, city)
                 return True, self._to_records(city, payload)
+            except HTTPError as exc:
+                logger.warning("City extraction failed city=%s http_status=%s", city.city, exc.code)
+                return False, []
             except Exception as exc:  # noqa: BLE001
                 logger.exception("City extraction failed city=%s error=%s", city.city, exc)
                 return False, []
@@ -209,7 +213,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=Path("data/bronze"))
     parser.add_argument("--start-date", type=date.fromisoformat, default=date.today())
     parser.add_argument("--end-date", type=date.fromisoformat, default=date.today())
-    parser.add_argument("--concurrency", type=int, default=100)
+    parser.add_argument("--concurrency", type=int, default=10)
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--api-url", default="https://api.open-meteo.com/v1/forecast")
     return parser

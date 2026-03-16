@@ -10,6 +10,7 @@ from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable, Deque, Optional, TypeVar
+from urllib.error import HTTPError
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +22,8 @@ class RetryConfig:
     """Configuration for exponential-backoff retries."""
 
     max_attempts: int = 5
-    base_delay: float = 0.5
-    max_delay: float = 30.0
+    base_delay: float = 1.0
+    max_delay: float = 60.0
     multiplier: float = 2.0
     jitter: float = 0.2
     retryable_exceptions: tuple[type[Exception], ...] = (TimeoutError, OSError)
@@ -37,6 +38,24 @@ def _compute_delay(config: RetryConfig, attempt: int) -> float:
     return delay
 
 
+def _retry_after_delay(exc: Exception) -> float | None:
+    if not isinstance(exc, HTTPError):
+        return None
+    header_value = exc.headers.get("Retry-After") if exc.headers else None
+    if not header_value:
+        return None
+    try:
+        return max(0.0, float(header_value))
+    except ValueError:
+        return None
+
+
+def _is_retryable_exception(exc: Exception, config: RetryConfig) -> bool:
+    if isinstance(exc, HTTPError):
+        return exc.code in config.retryable_status_codes
+    return isinstance(exc, config.retryable_exceptions)
+
+
 def with_retry(config: RetryConfig) -> Callable[[F], F]:
     """Decorator that retries async or sync functions with exponential backoff."""
 
@@ -48,17 +67,20 @@ def with_retry(config: RetryConfig) -> Callable[[F], F]:
                 for attempt in range(1, config.max_attempts + 1):
                     try:
                         return await func(*args, **kwargs)
-                    except config.retryable_exceptions as exc:
+                    except Exception as exc:  # noqa: BLE001
+                        if not _is_retryable_exception(exc, config):
+                            raise
                         last_exc = exc
                         if attempt == config.max_attempts:
                             break
-                        delay = _compute_delay(config, attempt)
+                        delay = _retry_after_delay(exc) or _compute_delay(config, attempt)
                         logger.warning(
-                            "Retrying %s attempt=%s/%s in %.2fs",
+                            "Retrying %s attempt=%s/%s in %.2fs (error=%s)",
                             func.__name__,
                             attempt,
                             config.max_attempts,
                             delay,
+                            exc,
                         )
                         await asyncio.sleep(delay)
                 assert last_exc is not None
@@ -71,17 +93,20 @@ def with_retry(config: RetryConfig) -> Callable[[F], F]:
             for attempt in range(1, config.max_attempts + 1):
                 try:
                     return func(*args, **kwargs)
-                except config.retryable_exceptions as exc:
+                except Exception as exc:  # noqa: BLE001
+                    if not _is_retryable_exception(exc, config):
+                        raise
                     last_exc = exc
                     if attempt == config.max_attempts:
                         break
-                    delay = _compute_delay(config, attempt)
+                    delay = _retry_after_delay(exc) or _compute_delay(config, attempt)
                     logger.warning(
-                        "Retrying %s attempt=%s/%s in %.2fs",
+                        "Retrying %s attempt=%s/%s in %.2fs (error=%s)",
                         func.__name__,
                         attempt,
                         config.max_attempts,
                         delay,
+                        exc,
                     )
                     time.sleep(delay)
 

@@ -28,7 +28,7 @@ PYTHONPATH=. python src/ingestion/open_meteo/extractor.py \
   --output-dir data/bronze \
   --start-date 2025-01-01 \
   --end-date 2025-01-01 \
-  --concurrency 100 \
+  --concurrency 10 \
   --api-url https://api.open-meteo.com/v1/forecast
 ```
 
@@ -39,7 +39,7 @@ PYTHONPATH=. python src/ingestion/open_meteo/extractor.py \
 
 ## Notes perf
 
-- Le paramètre `--concurrency` permet d'ajuster le parallélisme (100 conseillé pour démarrer).
+- Le paramètre `--concurrency` permet d'ajuster le parallélisme (10 conseillé pour démarrer afin d'éviter les 429).
 - Le retry + circuit breaker augmente la robustesse face aux erreurs transitoires (`429`, `5xx`, timeout, etc.).
 
 
@@ -47,3 +47,9 @@ PYTHONPATH=. python src/ingestion/open_meteo/extractor.py \
 
 Tu peux valider le pipeline sans dépendre d'Internet avec un faux serveur HTTP local (endpoint compatible).
 L'extracteur supporte `--api-url` pour ça.
+
+
+## Gestion des erreurs 429 (Too Many Requests)
+
+Si tu vois des `HTTP Error 429`, baisse `--concurrency` (ex: 5 ou 10).
+Le retry applique un backoff exponentiel et respecte `Retry-After` quand l'API le renvoie.
