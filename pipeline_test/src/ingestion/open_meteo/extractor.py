@@ -84,7 +84,7 @@ class City:
 
 @dataclass(frozen=True)
 class ExtractionResult:
-    status: Literal["ok", "retry", "failed"]
+    status: Literal["ok", "retry", "failed", "blocked"]
     city: City
     records: list[dict[str, Any]]
 
@@ -178,6 +178,11 @@ class OpenMeteoExtractor(BaseExtractor):
                     return ExtractionResult(status="retry", city=city, records=[])
                 logger.warning("City extraction failed city=%s http_status=%s", city.city, exc.code)
                 return ExtractionResult(status="failed", city=city, records=[])
+            except RuntimeError as exc:
+                if "Circuit breaker is open" in str(exc):
+                    return ExtractionResult(status="blocked", city=city, records=[])
+                logger.exception("City extraction failed city=%s error=%s", city.city, exc)
+                return ExtractionResult(status="failed", city=city, records=[])
             except Exception as exc:  # noqa: BLE001
                 logger.exception("City extraction failed city=%s error=%s", city.city, exc)
                 return ExtractionResult(status="failed", city=city, records=[])
@@ -191,12 +196,12 @@ class OpenMeteoExtractor(BaseExtractor):
                 handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     @staticmethod
-    def _ndjson_to_parquet(ndjson_path: Path, parquet_path: Path, chunk_size: int = 5000) -> None:
+    def _ndjson_to_parquet(ndjson_path: Path, parquet_path: Path, chunk_size: int = 5000) -> bool:
         try:
             import pyarrow as pa
             import pyarrow.parquet as pq
-        except ImportError as exc:
-            raise RuntimeError("pyarrow is required to write Parquet output. Install project dependencies first.") from exc
+        except ImportError:
+            return False
 
         writer: pq.ParquetWriter | None = None
         chunk: list[dict[str, Any]] = []
@@ -218,6 +223,7 @@ class OpenMeteoExtractor(BaseExtractor):
 
         if writer is not None:
             writer.close()
+        return True
 
     async def extract_full(self) -> Path:
         cities = self._load_cities()
@@ -252,7 +258,7 @@ class OpenMeteoExtractor(BaseExtractor):
                 if result.status == "ok":
                     success_count += 1
                     self._append_ndjson(temp_ndjson, result.records)
-                elif result.status == "retry":
+                elif result.status in {"retry", "blocked"}:
                     next_pending.append(result.city)
                 else:
                     failed_count += 1
@@ -261,7 +267,7 @@ class OpenMeteoExtractor(BaseExtractor):
             if pending:
                 cooldown = min(300, 5 * (2 ** min(round_no - 1, 5)))
                 logger.warning(
-                    "Rate limited on %s cities. Cooling down %ss before retry round %s",
+                    "Rate limited/blocked on %s cities. Cooling down %ss before retry round %s",
                     len(pending),
                     cooldown,
                     round_no + 1,
@@ -269,8 +275,16 @@ class OpenMeteoExtractor(BaseExtractor):
                 await asyncio.sleep(cooldown)
 
         if temp_ndjson.exists() and temp_ndjson.stat().st_size > 0:
-            self._ndjson_to_parquet(temp_ndjson, output_file)
-            temp_ndjson.unlink(missing_ok=True)
+            converted = self._ndjson_to_parquet(temp_ndjson, output_file)
+            if converted:
+                temp_ndjson.unlink(missing_ok=True)
+            else:
+                fallback_file = self.output_dir / f"openmeteo_hourly_{self.start_date}_{self.end_date}.ndjson"
+                temp_ndjson.replace(fallback_file)
+                logger.warning(
+                    "pyarrow not installed: parquet conversion skipped. Raw NDJSON kept at %s",
+                    fallback_file,
+                )
         else:
             logger.warning("No successful records extracted; no parquet file generated")
 

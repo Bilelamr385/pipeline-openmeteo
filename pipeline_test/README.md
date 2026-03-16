@@ -55,3 +55,7 @@ L'extracteur supporte `--api-url` pour ça.
 Si tu vois des `HTTP Error 429`, baisse `--concurrency` (ex: 5 ou 10).
 Le retry applique un backoff exponentiel et respecte `Retry-After` quand l'API le renvoie.
 Les villes en 429 sont replanifiées par vagues avec une phase de cooldown globale pour éviter de bloquer définitivement le run.
+
+Si le circuit breaker est temporairement ouvert, les villes concernées sont replanifiées au round suivant (pas perdues).
+
+Si `pyarrow` n'est pas installé, la conversion parquet est sautée et un fichier NDJSON de secours est conservé dans `data/bronze`.
