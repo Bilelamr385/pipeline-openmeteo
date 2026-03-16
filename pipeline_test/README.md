@@ -23,14 +23,14 @@ L'extracteur demande exactement les variables horaires suivantes (mapping Open-M
 Depuis `pipeline_test/`:
 
 ```bash
-PYTHONPATH=. python src/ingestion/open_meteo/extractor.py \
+PYTHONPATH=. python3 src/ingestion/open_meteo/extractor.py \
   --cities-csv data/cities_10000.csv \
   --output-dir data/bronze \
   --start-date 2025-01-01 \
   --end-date 2025-01-01 \
   --concurrency 10 \
   --max-rounds 0 \
-  --api-url https://api.open-meteo.com/v1/forecast
+  --api-url https://archive-api.open-meteo.com/v1/archive
 ```
 
 ## Sortie
@@ -59,3 +59,7 @@ Les villes en 429 sont replanifiées par vagues avec une phase de cooldown globa
 Si le circuit breaker est temporairement ouvert, les villes concernées sont replanifiées au round suivant (pas perdues).
 
 Si `pyarrow` n'est pas installé, la conversion parquet est sautée et un fichier NDJSON de secours est conservé dans `data/bronze`.
+
+
+Par défaut, le circuit breaker est désactivé pour éviter les faux blocages sur gros volumes.
+Tu peux le réactiver avec `--use-circuit-breaker` si besoin.

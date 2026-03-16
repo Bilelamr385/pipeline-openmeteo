@@ -22,7 +22,6 @@ from src.ingestion.common.retry import (
     CircuitBreaker,
     CircuitBreakerConfig,
     RetryConfig,
-    call_with_circuit_breaker,
     with_retry,
 )
 
@@ -102,6 +101,7 @@ class OpenMeteoExtractor(BaseExtractor):
         request_timeout_s: float = 30.0,
         api_url: str = "https://api.open-meteo.com/v1/forecast",
         max_rounds: int = 0,
+        use_circuit_breaker: bool = False,
     ) -> None:
         super().__init__(output_dir=output_dir)
         self.cities_csv = cities_csv
@@ -111,6 +111,7 @@ class OpenMeteoExtractor(BaseExtractor):
         self.request_timeout_s = request_timeout_s
         self.api_url = api_url
         self.max_rounds = max_rounds
+        self.use_circuit_breaker = use_circuit_breaker
         self.circuit_breaker = CircuitBreaker(CircuitBreakerConfig())
 
     def _load_cities(self) -> list[City]:
@@ -171,7 +172,11 @@ class OpenMeteoExtractor(BaseExtractor):
     async def _extract_one(self, city: City, semaphore: asyncio.Semaphore) -> ExtractionResult:
         async with semaphore:
             try:
-                payload = await call_with_circuit_breaker(self.circuit_breaker, self._fetch_city, city)
+                if self.use_circuit_breaker:
+                    from src.ingestion.common.retry import call_with_circuit_breaker
+                    payload = await call_with_circuit_breaker(self.circuit_breaker, self._fetch_city, city)
+                else:
+                    payload = await self._fetch_city(city)
                 return ExtractionResult(status="ok", city=city, records=self._to_records(city, payload))
             except HTTPError as exc:
                 if exc.code == 429:
@@ -180,7 +185,7 @@ class OpenMeteoExtractor(BaseExtractor):
                 return ExtractionResult(status="failed", city=city, records=[])
             except RuntimeError as exc:
                 if "Circuit breaker is open" in str(exc):
-                    return ExtractionResult(status="blocked", city=city, records=[])
+                    return ExtractionResult(status="retry", city=city, records=[])
                 logger.exception("City extraction failed city=%s error=%s", city.city, exc)
                 return ExtractionResult(status="failed", city=city, records=[])
             except Exception as exc:  # noqa: BLE001
@@ -274,6 +279,7 @@ class OpenMeteoExtractor(BaseExtractor):
                 )
                 await asyncio.sleep(cooldown)
 
+        final_output = output_file
         if temp_ndjson.exists() and temp_ndjson.stat().st_size > 0:
             converted = self._ndjson_to_parquet(temp_ndjson, output_file)
             if converted:
@@ -281,21 +287,22 @@ class OpenMeteoExtractor(BaseExtractor):
             else:
                 fallback_file = self.output_dir / f"openmeteo_hourly_{self.start_date}_{self.end_date}.ndjson"
                 temp_ndjson.replace(fallback_file)
+                final_output = fallback_file
                 logger.warning(
                     "pyarrow not installed: parquet conversion skipped. Raw NDJSON kept at %s",
                     fallback_file,
                 )
         else:
-            logger.warning("No successful records extracted; no parquet file generated")
+            logger.warning("No successful records extracted; no output file generated")
 
         logger.info(
             "Extraction done. Output file: %s | success=%s failed=%s pending=%s",
-            output_file,
+            final_output,
             success_count,
             failed_count,
             len(pending),
         )
-        return output_file
+        return final_output
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -308,6 +315,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-rounds", type=int, default=0, help="0 = retry until all 429 cities succeed")
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--api-url", default="https://api.open-meteo.com/v1/forecast")
+    parser.add_argument("--use-circuit-breaker", action="store_true", help="Enable circuit breaker (disabled by default)")
     return parser
 
 
@@ -323,6 +331,7 @@ async def _run_from_cli() -> None:
         concurrency=args.concurrency,
         api_url=args.api_url,
         max_rounds=args.max_rounds,
+        use_circuit_breaker=args.use_circuit_breaker,
     )
     await extractor.extract_full()
 

@@ -26,16 +26,21 @@ class RetryConfig:
     max_delay: float = 60.0
     multiplier: float = 2.0
     jitter: float = 0.2
+    jitter_on_retry_after: bool = False
     retryable_exceptions: tuple[type[Exception], ...] = (TimeoutError, OSError)
     retryable_status_codes: frozenset[int] = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 
+def _apply_jitter(delay: float, jitter_factor: float) -> float:
+    if jitter_factor <= 0:
+        return delay
+    jitter = random.uniform(-jitter_factor, jitter_factor) * delay  # noqa: S311
+    return max(0.0, delay + jitter)
+
+
 def _compute_delay(config: RetryConfig, attempt: int) -> float:
-    delay = min(config.base_delay * (config.multiplier ** (attempt - 1)), config.max_delay)
-    if config.jitter > 0:
-        jitter = random.uniform(-config.jitter, config.jitter) * delay  # noqa: S311
-        delay = max(0.0, delay + jitter)
-    return delay
+    base = min(config.base_delay * (config.multiplier ** (attempt - 1)), config.max_delay)
+    return _apply_jitter(base, config.jitter)
 
 
 def _retry_after_delay(exc: Exception) -> float | None:
@@ -73,7 +78,11 @@ def with_retry(config: RetryConfig) -> Callable[[F], F]:
                         last_exc = exc
                         if attempt == config.max_attempts:
                             break
-                        delay = _retry_after_delay(exc) or _compute_delay(config, attempt)
+                        retry_after = _retry_after_delay(exc)
+                        if retry_after is not None:
+                            delay = _apply_jitter(retry_after, config.jitter if config.jitter_on_retry_after else 0.0)
+                        else:
+                            delay = _compute_delay(config, attempt)
                         logger.warning(
                             "Retrying %s attempt=%s/%s in %.2fs (error=%s)",
                             func.__name__,
@@ -99,7 +108,11 @@ def with_retry(config: RetryConfig) -> Callable[[F], F]:
                     last_exc = exc
                     if attempt == config.max_attempts:
                         break
-                    delay = _retry_after_delay(exc) or _compute_delay(config, attempt)
+                    retry_after = _retry_after_delay(exc)
+                    if retry_after is not None:
+                        delay = _apply_jitter(retry_after, config.jitter if config.jitter_on_retry_after else 0.0)
+                    else:
+                        delay = _compute_delay(config, attempt)
                     logger.warning(
                         "Retrying %s attempt=%s/%s in %.2fs (error=%s)",
                         func.__name__,
